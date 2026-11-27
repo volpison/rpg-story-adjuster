@@ -11,9 +11,9 @@ Asset Tools deals with files, names, references, and audio.
 | Goal | Description |
 |------|-------------|
 | **Readable events** | Convert cryptic command JSON into a clear, line-oriented text form (and back) |
-| **Safe ID reassign** | Find and optionally remap switch / variable numeric IDs across a project |
+| **Safe ID reassign** | Find, and optionally remap, switch / variable numeric IDs across a project, with a proof that nothing was missed |
 | **AI- and human-friendly editing** | Let people (or agents) edit story data in a form that is easier to reason about, then emit valid MZ JSON again |
-| **Round-trip safety** | After convert → edit → convert-back, RPG Maker MZ must still load the project |
+| **Round-trip safety** | After convert → edit → convert-back, RPG Maker MZ must still load the project, and what was not edited must not change |
 
 ## Non-goals
 
@@ -30,13 +30,22 @@ RPG Maker MZ stores events as lists of commands, for example:
 {"code": 122, "indent": 1, "parameters": [308, 308, 2, 0, 100]}
 ```
 
-Story Adjuster aims to present that as something closer to:
+That is *Control Variables*: variable 308 (first and last of the range), operation 2 (subtract), operand type 0 (a constant), value 100.
+Story Adjuster aims to present it as something closer to:
 
 ```text
-Variable[100] -= 308
+Variable[308] -= 100
 ```
 
 …and to turn the readable form back into the exact JSON structure the engine expects.
+
+## How it will be built
+
+- **One table of event commands.** Every command code, with the role of each parameter (switch ID, variable ID, text, script, …). Printing, parsing and ID scanning all read the same table, so they cannot disagree about where an ID hides.
+- **Nothing is lost.** A command the tool does not know is kept as a raw JSON node, so plugin commands survive a round trip untouched.
+- **Only what you edit changes.** Files and events you did not touch stay byte-for-byte identical, so a story change is a small, reviewable Git diff.
+- **Dry-run first.** Scans and previews never write. Any write makes a backup first, can be undone, and is checked afterwards by scanning again.
+- **Command line first.** The core is plain Python with no GUI; a window can come later.
 
 ## Status
 
