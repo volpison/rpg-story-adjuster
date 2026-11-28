@@ -136,6 +136,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reassign-dry-run":
             print("\ndry run - nothing written")
             return 0
+        if not plan.patches_by_file:
+            print("\nno patches to apply — nothing written")
+            return 0
         try:
             backup_dir = apply_plan(args.project_root, plan)
         except Exception as e:
