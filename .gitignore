@@ -8,5 +8,8 @@ dist/
 rpg-story-adjuster/
 rpg-story-adjuster.zip
 
+all_commands.txt
+all_summary.txt
+
 *.lnk
 *.bat

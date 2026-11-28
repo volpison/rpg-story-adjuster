@@ -137,11 +137,13 @@ def main(argv: list[str] | None = None) -> int:
             print("\ndry run - nothing written")
             return 0
         try:
-            apply_plan(args.project_root, plan)
+            backup_dir = apply_plan(args.project_root, plan)
         except Exception as e:
             print(f"apply failed: {e}", file=sys.stderr)
             return 1
         print(f"\napplied. post-scan invariant verified.")
+        if backup_dir:
+            print(f"backup: {backup_dir}")
         return 0
 
     return 2

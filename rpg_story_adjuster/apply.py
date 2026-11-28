@@ -1,5 +1,7 @@
 from __future__ import annotations
+import shutil
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -108,10 +110,7 @@ def build_plan(root: Path, kind: str, old_id: int, new_id: int) -> ReassignPlan:
                 f"idx={hit.source.command_index} ({hit.detail})"
             )
             continue
-        # via == "command" -- this hit is rewritten. It counts as ONE hit
-        # toward the post-check regardless of how many parameter slots it
-        # touches (a degenerate range like [10,10,0] rewrites two slots but
-        # is still one hit after rescan).
+        # via == "command" -- one hit, regardless of how many slots it touches.
         plan.expected_new_hits += 1
         base = hit.source.json_path + ("parameters",)
         for pi in hit.param_indices:
@@ -129,13 +128,48 @@ def build_plan(root: Path, kind: str, old_id: int, new_id: int) -> ReassignPlan:
     return plan
 
 
-def apply_plan(root: Path, plan: ReassignPlan) -> None:
-    """Write every patch atomically per file. Roll back all files on any failure."""
+def _make_backup_dir(root: Path) -> Path:
+    """Create a fresh timestamped backup folder under <project>/.rpgadj_backups/.
+
+    One folder per apply operation. Never reused, never overwritten.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = root / ".rpgadj_backups" / stamp
+    n = 0
+    while base.exists():
+        n += 1
+        base = root / ".rpgadj_backups" / f"{stamp}-{n}"
+    base.mkdir(parents=True)
+    return base
+
+
+def apply_plan(
+    root: Path, plan: ReassignPlan, *, write_backups: bool = True,
+) -> Path | None:
+    """Write every patch atomically per file. Roll back on any failure.
+
+    Before any byte is written, copies every file that will be touched into
+    `<project>/.rpgadj_backups/<timestamp>/`. Returns that directory on success
+    so the caller can print it; the folder is deliberately left in place.
+
+    If `write_backups=False` (tests), no backup folder is created and rollback
+    relies on the in-memory snapshot only.
+    """
     if not plan.patches_by_file:
-        return
+        return None
 
     backups: dict[Path, bytes] = {}
     written: list[Path] = []
+    backup_dir: Path | None = None
+
+    if write_backups:
+        backup_dir = _make_backup_dir(root)
+        for rel_file in plan.patches_by_file:
+            full = root / rel_file
+            dest = backup_dir / rel_file
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(full, dest)
+
     try:
         for rel_file, patches in plan.patches_by_file.items():
             full = root / rel_file
@@ -150,17 +184,20 @@ def apply_plan(root: Path, plan: ReassignPlan) -> None:
                 pass
         raise
 
-    # Post-condition: rescan; invariant must hold.
     after_old = scan_project(root, plan.kind, plan.old_id)
     after_new = scan_project(root, plan.kind, plan.new_id)
+    hint = (
+        f"Original files preserved at: {backup_dir}"
+        if backup_dir else "No on-disk backup; only in-memory rollback available."
+    )
     if after_old.hits:
         raise ReassignError(
             f"post-check failed: {plan.kind} {plan.old_id} still has "
-            f"{len(after_old.hits)} hit(s). Files written: {written}. "
-            "Restore from .bak backups manually if needed."
+            f"{len(after_old.hits)} hit(s). Files written: {written}. {hint}"
         )
     if len(after_new.hits) != plan.expected_new_hits:
         raise ReassignError(
             f"post-check failed: expected {plan.expected_new_hits} hit(s) "
-            f"for {plan.kind} {plan.new_id}, got {len(after_new.hits)}"
+            f"for {plan.kind} {plan.new_id}, got {len(after_new.hits)}. {hint}"
         )
+    return backup_dir
