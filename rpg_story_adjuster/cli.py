@@ -17,12 +17,9 @@ def _add_reassign_args(p: argparse.ArgumentParser) -> None:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--switch", type=int, metavar="OLD_ID")
     g.add_argument("--variable", type=int, metavar="OLD_ID")
-    g.add_argument("--switch-map", type=_map_arg, metavar="OLD:NEW,...",
-                   help="Batch: comma-separated OLD:NEW pairs (switch)")
-    g.add_argument("--variable-map", type=_map_arg, metavar="OLD:NEW,...",
-                   help="Batch: comma-separated OLD:NEW pairs (variable)")
-    p.add_argument("--to", type=int, metavar="NEW_ID",
-                   help="Required with --switch / --variable")
+    g.add_argument("--switch-map", type=_map_arg, metavar="OLD:NEW,...")
+    g.add_argument("--variable-map", type=_map_arg, metavar="OLD:NEW,...")
+    p.add_argument("--to", type=int, metavar="NEW_ID")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +44,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--switch", type=int, metavar="ID")
     g.add_argument("--variable", type=int, metavar="ID")
     sc.add_argument("--show-dynamic", action="store_true")
+
+    pr = sub.add_parser("print", help="Pretty-print event commands as text.")
+    pr.add_argument("project_root", type=Path)
+    pr.add_argument("--file", default=None,
+                    help="Restrict to one data file, e.g. Map001.json")
+    pr.add_argument("--event", type=int, default=None,
+                    help="Restrict to one event ID")
+    pr.add_argument("--page", type=int, default=None,
+                    help="Restrict to one page index")
+    pr.add_argument("--out", type=Path, default=None,
+                    help="Write to file instead of stdout")
 
     dr = sub.add_parser("reassign-dry-run",
                         help="Preview a switch/variable ID reassign (single or batch).")
@@ -73,10 +81,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from rpg_story_adjuster.gui.main_window import run
         except ImportError as e:
-            print(
-                f"GUI requires PySide6 (pip install -e '.[gui]'):\n  {e}",
-                file=sys.stderr,
-            )
+            print(f"GUI requires PySide6 (pip install -e '.[gui]'):\n  {e}",
+                  file=sys.stderr)
             return 1
         project = getattr(args, "project", None)
         return run(project_root=project)
@@ -131,12 +137,25 @@ def main(argv: list[str] | None = None) -> int:
                       f"idx={s.command_index} | via={d.via} | {d.snippet}")
         return 0
 
+    if args.command == "print":
+        from rpg_story_adjuster.printer import print_project
+        text = print_project(
+            args.project_root,
+            file=args.file, event=args.event, page=args.page,
+        )
+        if args.out:
+            args.out.write_text(text, encoding="utf-8")
+            print(f"wrote {len(text.splitlines())} line(s) to {args.out}",
+                  file=sys.stderr)
+        else:
+            sys.stdout.write(text)
+        return 0
+
     if args.command in ("reassign-dry-run", "reassign-apply"):
         from rpg_story_adjuster.apply import (
             build_plan, build_batch_plan, apply_plan, ReassignError,
         )
 
-        # Resolve single vs batch
         if args.switch is not None or args.variable is not None:
             if args.to is None:
                 print("error: --to is required with --switch/--variable",
@@ -151,8 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         else:
             if args.to is not None:
-                print("error: --to not allowed with --*-map",
-                      file=sys.stderr)
+                print("error: --to not allowed with --*-map", file=sys.stderr)
                 return 2
             kind = "switch" if args.switch_map is not None else "variable"
             mapping = args.switch_map if args.switch_map is not None else args.variable_map
