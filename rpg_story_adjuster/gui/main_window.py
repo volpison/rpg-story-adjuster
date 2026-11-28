@@ -14,7 +14,7 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
-    QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
 )
@@ -48,23 +48,28 @@ class _PlanWorker(QThread):
     finished_result = Signal(object)   # ReassignPlan
     failed = Signal(str)
 
-    def __init__(self, root: Path, kind: str, old_id: int, new_id: int) -> None:
+    def __init__(self, root: Path, kind: str,
+                 mapping: dict[int, int] | None = None,
+                 single: tuple[int, int] | None = None) -> None:
         super().__init__()
         self._root = root
         self._kind = kind
-        self._old = old_id
-        self._new = new_id
+        self._mapping = mapping
+        self._single = single
 
     def run(self) -> None:
+        from rpg_story_adjuster.apply import build_batch_plan, build_plan, ReassignError
         try:
-            self.finished_result.emit(
-                build_plan(self._root, self._kind, self._old, self._new)
-            )
+            if self._mapping is not None:
+                plan = build_batch_plan(self._root, self._kind, self._mapping)
+            else:
+                assert self._single is not None
+                plan = build_plan(self._root, self._kind, self._single[0], self._single[1])
+            self.finished_result.emit(plan)
         except ReassignError as e:
             self.failed.emit(str(e))
         except Exception as e:
             self.failed.emit(f"unexpected: {e}")
-
 
 class _ApplyWorker(QThread):
     finished_result = Signal(object)   # Path | None (backup dir)
@@ -123,21 +128,40 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(w)
 
         controls = QHBoxLayout()
-        self._scan_kind = QComboBox()
-        self._scan_kind.addItems(["switch", "variable"])
-        self._scan_id = QSpinBox()
-        self._scan_id.setRange(1, 9999)
-        self._scan_id.setValue(1)
-        self._scan_dynamic = QCheckBox("Show dynamic refs")
-        self._scan_btn = QPushButton("Scan")
-        self._scan_btn.clicked.connect(self._on_scan)
+        self._rr_kind = QComboBox()
+        self._rr_kind.addItems(["switch", "variable"])
+        self._rr_batch_cb = QCheckBox("Batch")
+        self._rr_batch_cb.toggled.connect(self._on_batch_toggle)
+
+        self._rr_old_label = QLabel("Old:")
+        self._rr_old = QSpinBox(); self._rr_old.setRange(1, 9999); self._rr_old.setValue(1)
+        self._rr_new_label = QLabel("New:")
+        self._rr_new = QSpinBox(); self._rr_new.setRange(1, 9999); self._rr_new.setValue(2)
+
+        self._rr_map_label = QLabel("Map:")
+        self._rr_map = QLineEdit()
+        self._rr_map.setPlaceholderText("10:47,20:30")
+        self._rr_map.setMinimumWidth(220)
+        self._rr_map.setVisible(False)
+        self._rr_map_label.setVisible(False)
+
+        self._rr_dry_btn = QPushButton("Dry run")
+        self._rr_dry_btn.clicked.connect(self._on_dry_run)
+        self._rr_apply_btn = QPushButton("Apply")
+        self._rr_apply_btn.setEnabled(False)
+        self._rr_apply_btn.clicked.connect(self._on_apply)
 
         controls.addWidget(QLabel("Kind:"))
-        controls.addWidget(self._scan_kind)
-        controls.addWidget(QLabel("ID:"))
-        controls.addWidget(self._scan_id)
-        controls.addWidget(self._scan_dynamic)
-        controls.addWidget(self._scan_btn)
+        controls.addWidget(self._rr_kind)
+        controls.addWidget(self._rr_batch_cb)
+        controls.addWidget(self._rr_old_label)
+        controls.addWidget(self._rr_old)
+        controls.addWidget(self._rr_new_label)
+        controls.addWidget(self._rr_new)
+        controls.addWidget(self._rr_map_label)
+        controls.addWidget(self._rr_map)
+        controls.addWidget(self._rr_dry_btn)
+        controls.addWidget(self._rr_apply_btn)
         controls.addStretch(1)
         v.addLayout(controls)
 
@@ -271,19 +295,33 @@ class MainWindow(QMainWindow):
             return
         if self._busy():
             return
+        from rpg_story_adjuster.apply import parse_mapping_str, ReassignError
         kind = self._rr_kind.currentText()
-        old, new = self._rr_old.value(), self._rr_new.value()
         self._plan_tree.clear()
         self._warnings.clear()
         self._plan = None
         self._rr_apply_btn.setEnabled(False)
         self._rr_dry_btn.setEnabled(False)
-        self.statusBar().showMessage(f"Building plan: {kind} {old} → {new}…")
-        self._worker = _PlanWorker(self._project_root, kind, old, new)
+
+        if self._rr_batch_cb.isChecked():
+            text = self._rr_map.text().strip()
+            try:
+                mapping = parse_mapping_str(text)
+            except ReassignError as e:
+                self._rr_dry_btn.setEnabled(True)
+                QMessageBox.warning(self, "Invalid mapping", str(e))
+                return
+            self.statusBar().showMessage(f"Building batch plan ({len(mapping)} pairs)…")
+            self._worker = _PlanWorker(self._project_root, kind, mapping=mapping)
+        else:
+            old, new = self._rr_old.value(), self._rr_new.value()
+            self.statusBar().showMessage(f"Building plan: {kind} {old} → {new}…")
+            self._worker = _PlanWorker(self._project_root, kind, single=(old, new))
+
         self._worker.finished_result.connect(self._on_plan_done)
         self._worker.failed.connect(self._on_plan_failed)
         self._worker.start()
-
+        
     def _on_plan_done(self, plan: ReassignPlan) -> None:
         self._rr_dry_btn.setEnabled(True)
         self._plan = plan
@@ -345,6 +383,13 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Apply failed", msg)
         self.statusBar().showMessage("Apply failed")
 
+    def _on_batch_toggle(self, checked: bool) -> None:
+        self._rr_old_label.setVisible(not checked)
+        self._rr_old.setVisible(not checked)
+        self._rr_new_label.setVisible(not checked)
+        self._rr_new.setVisible(not checked)
+        self._rr_map_label.setVisible(checked)
+        self._rr_map.setVisible(checked)
 
 def _fmt(v) -> str:
     return "—" if v is None else str(v)

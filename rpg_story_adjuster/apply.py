@@ -15,7 +15,27 @@ class ReassignError(Exception):
     pass
 
 
-# ---- In-memory (used by invariant tests, Phase 1) ----
+def parse_mapping_str(s: str) -> dict[int, int]:
+    """Parse '10:47,20:30' into {10:47, 20:30}."""
+    result: dict[int, int] = {}
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            old_s, new_s = part.split(":")
+            old, new = int(old_s.strip()), int(new_s.strip())
+        except ValueError:
+            raise ReassignError(f"invalid mapping entry: {part!r}")
+        if old in result:
+            raise ReassignError(f"duplicate old ID {old}")
+        result[old] = new
+    if not result:
+        raise ReassignError("empty mapping")
+    return result
+
+
+# ---- In-memory (used by invariant tests) ----
 
 @dataclass
 class ApplyResult:
@@ -66,73 +86,116 @@ def apply_reassign_to_commands(
     return r
 
 
-# ---- On-disk (Phase 4-lite) ----
+# ---- Plan ----
 
 @dataclass
 class ReassignPlan:
-    old_id: int
-    new_id: int
+    old_id: int | None          # populated for single; None for batch
+    new_id: int | None          # populated for single; None for batch
     kind: str
+    mapping: dict[int, int] = field(default_factory=dict)
     patches_by_file: dict[str, list[tuple]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
-    expected_new_hits: int = 0
+    expected_post: dict[int, int] = field(default_factory=dict)
 
 
-def build_plan(root: Path, kind: str, old_id: int, new_id: int) -> ReassignPlan:
-    """Scan, validate, and prepare a reassign plan. Does not write."""
-    if old_id == new_id:
-        raise ReassignError("old_id == new_id; nothing to do")
-    if old_id < 1 or new_id < 1:
-        raise ReassignError("IDs must be positive")
+def _compute_expected_post(
+    before_hits: dict[int, int], mapping: dict[int, int],
+) -> dict[int, int]:
+    """Compute {id: expected_hits_after_apply}.
 
-    existing_new = scan_project(root, kind, new_id)
-    if existing_new.hits:
-        raise ReassignError(
-            f"refusing: {kind} {new_id} is already in use "
-            f"({len(existing_new.hits)} hit(s))"
-        )
+    After apply, hit X moves to mapping.get(X, X). So expected_post[Z] is the
+    sum of before_hits[X] for every X whose resulting ID is Z. All sources are
+    included in the result so a "should be 0" check works uniformly.
+    """
+    result: dict[int, int] = {}
+    for x, cnt in before_hits.items():
+        dest = mapping.get(x, x)
+        result[dest] = result.get(dest, 0) + cnt
+    for src in mapping.keys():
+        if src not in result:
+            result[src] = 0
+    return result
 
-    result = scan_project(root, kind, old_id)
-    plan = ReassignPlan(old_id=old_id, new_id=new_id, kind=kind)
 
-    for hit in result.hits:
-        if hit.via == "range":
+def build_batch_plan(
+    root: Path, kind: str, mapping: dict[int, int],
+) -> ReassignPlan:
+    """Build a batch reassign plan. Handles single-pair dicts identically."""
+    if not mapping:
+        raise ReassignError("empty mapping")
+
+    for old, new in mapping.items():
+        if old < 1 or new < 1:
+            raise ReassignError("IDs must be positive")
+        if old == new:
+            raise ReassignError(f"old_id == new_id for {old}")
+
+    targets = list(mapping.values())
+    if len(set(targets)) != len(targets):
+        seen: set[int] = set()
+        dups = [t for t in targets if t in seen or seen.add(t)]  # type: ignore[func-returns-value]
+        raise ReassignError(f"duplicate target ID(s): {sorted(set(dups))}")
+
+    sources = set(mapping.keys())
+    all_ids = sources | set(targets)
+
+    scan_results = {id_: scan_project(root, kind, id_) for id_ in all_ids}
+    before_hits = {id_: len(scan_results[id_].hits) for id_ in all_ids}
+
+    for new in targets:
+        if new not in sources and before_hits.get(new, 0) > 0:
+            raise ReassignError(
+                f"refusing: {kind} {new} is already in use "
+                f"({before_hits[new]} hit(s))"
+            )
+
+    plan = ReassignPlan(old_id=None, new_id=None, kind=kind, mapping=dict(mapping))
+
+    for old, new in mapping.items():
+        result = scan_results[old]
+        for hit in result.hits:
+            if hit.via == "range":
+                plan.warnings.append(
+                    f"skip range {hit.range_bounds}: {hit.source.file} "
+                    f"ev={hit.source.event_id} pg={hit.source.page_index} "
+                    f"idx={hit.source.command_index}"
+                )
+                continue
+            if hit.via in ("script", "text"):
+                plan.warnings.append(
+                    f"skip {hit.via}: {hit.source.file} "
+                    f"ev={hit.source.event_id} pg={hit.source.page_index} "
+                    f"idx={hit.source.command_index} ({hit.detail})"
+                )
+                continue
+            base = hit.source.json_path + ("parameters",)
+            for pi in hit.param_indices:
+                plan.patches_by_file.setdefault(hit.source.file, []).append(
+                    (base + (pi,), old, new)
+                )
+        for d in result.dynamic:
             plan.warnings.append(
-                f"skip range {hit.range_bounds}: {hit.source.file} "
-                f"ev={hit.source.event_id} pg={hit.source.page_index} "
-                f"idx={hit.source.command_index}"
-            )
-            continue
-        if hit.via in ("script", "text"):
-            plan.warnings.append(
-                f"skip {hit.via}: {hit.source.file} "
-                f"ev={hit.source.event_id} pg={hit.source.page_index} "
-                f"idx={hit.source.command_index} ({hit.detail})"
-            )
-            continue
-        # via == "command" -- one hit, regardless of how many slots it touches.
-        plan.expected_new_hits += 1
-        base = hit.source.json_path + ("parameters",)
-        for pi in hit.param_indices:
-            plan.patches_by_file.setdefault(hit.source.file, []).append(
-                (base + (pi,), old_id, new_id)
+                f"dynamic {d.via}: {d.source.file} "
+                f"ev={d.source.event_id} pg={d.source.page_index} "
+                f"idx={d.source.command_index} ({d.snippet})"
             )
 
-    for d in result.dynamic:
-        plan.warnings.append(
-            f"dynamic {d.via}: {d.source.file} "
-            f"ev={d.source.event_id} pg={d.source.page_index} "
-            f"idx={d.source.command_index} ({d.snippet})"
-        )
-
+    plan.expected_post = _compute_expected_post(before_hits, mapping)
     return plan
 
 
-def _make_backup_dir(root: Path) -> Path:
-    """Create a fresh timestamped backup folder under <project>/.rpgadj_backups/.
+def build_plan(root: Path, kind: str, old_id: int, new_id: int) -> ReassignPlan:
+    """Single-pair wrapper around build_batch_plan."""
+    plan = build_batch_plan(root, kind, {old_id: new_id})
+    plan.old_id = old_id
+    plan.new_id = new_id
+    return plan
 
-    One folder per apply operation. Never reused, never overwritten.
-    """
+
+# ---- Apply ----
+
+def _make_backup_dir(root: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = root / ".rpgadj_backups" / stamp
     n = 0
@@ -146,14 +209,10 @@ def _make_backup_dir(root: Path) -> Path:
 def apply_plan(
     root: Path, plan: ReassignPlan, *, write_backups: bool = True,
 ) -> Path | None:
-    """Write every patch atomically per file. Roll back on any failure.
+    """Write patches, rescan to verify the invariant, roll back on any failure.
 
-    Before any byte is written, copies every file that will be touched into
-    `<project>/.rpgadj_backups/<timestamp>/`. Returns that directory on success
-    so the caller can print it; the folder is deliberately left in place.
-
-    If `write_backups=False` (tests), no backup folder is created and rollback
-    relies on the in-memory snapshot only.
+    Backups go to `<project>/.rpgadj_backups/<timestamp>/` before any write.
+    Returns the backup directory on success (None if write_backups=False).
     """
     if not plan.patches_by_file:
         return None
@@ -184,20 +243,17 @@ def apply_plan(
                 pass
         raise
 
-    after_old = scan_project(root, plan.kind, plan.old_id)
-    after_new = scan_project(root, plan.kind, plan.new_id)
     hint = (
         f"Original files preserved at: {backup_dir}"
         if backup_dir else "No on-disk backup; only in-memory rollback available."
     )
-    if after_old.hits:
-        raise ReassignError(
-            f"post-check failed: {plan.kind} {plan.old_id} still has "
-            f"{len(after_old.hits)} hit(s). Files written: {written}. {hint}"
-        )
-    if len(after_new.hits) != plan.expected_new_hits:
-        raise ReassignError(
-            f"post-check failed: expected {plan.expected_new_hits} hit(s) "
-            f"for {plan.kind} {plan.new_id}, got {len(after_new.hits)}. {hint}"
-        )
+    # Generalized post-check: every ID in expected_post must match.
+    for id_, expected in plan.expected_post.items():
+        after = scan_project(root, plan.kind, id_)
+        if len(after.hits) != expected:
+            raise ReassignError(
+                f"post-check failed for {plan.kind} {id_}: "
+                f"expected {expected} hit(s), got {len(after.hits)}. "
+                f"Files written: {written}. {hint}"
+            )
     return backup_dir
