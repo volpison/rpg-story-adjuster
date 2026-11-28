@@ -16,7 +16,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="rpg-story-adjuster")
     sub = p.add_subparsers(dest="command")
 
-    sub.add_parser("gui", help="Open the GUI (default when no subcommand given).")
+    gui = sub.add_parser("gui", help="Open the GUI (default when no subcommand given).")
+    gui.add_argument("--project", type=Path, default=None,
+                     help="Optional project root to pre-load.")
 
     lf = sub.add_parser("list-files", help="List *.json under <project>/data/.")
     lf.add_argument("project_root", type=Path)
@@ -46,10 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Windows redirects default to cp1252 which chokes on emoji and other
-    # non-cp1252 characters in text parameters. Force UTF-8 on both streams;
-    # replace (not raise) on unencodable characters so we degrade gracefully
-    # instead of silently truncating output mid-file.
+    # Force UTF-8 on stdout/stderr so emoji in text parameters don't crash
+    # on Windows redirects. Replace (not raise) on unencodable chars.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
@@ -60,8 +60,16 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.command in (None, "gui"):
-        from rpg_story_adjuster.gui.main_window import run
-        return run()
+        try:
+            from rpg_story_adjuster.gui.main_window import run
+        except ImportError as e:
+            print(
+                f"GUI requires PySide6 (pip install -e '.[gui]'):\n  {e}",
+                file=sys.stderr,
+            )
+            return 1
+        project = getattr(args, "project", None)
+        return run(project_root=project)
 
     if args.command == "list-files":
         from rpg_story_adjuster.project import Project
@@ -137,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             print("\ndry run - nothing written")
             return 0
         if not plan.patches_by_file:
-            print("\nno patches to apply — nothing written")
+            print("\nno patches to apply - nothing written")
             return 0
         try:
             backup_dir = apply_plan(args.project_root, plan)
