@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+rpg-story-adjuster/
+rpg-story-adjuster.zip
+
+*.lnk
+*.bat
